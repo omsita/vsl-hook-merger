@@ -266,62 +266,155 @@ class CloudBatchWorker(threading.Thread):
                 pass
 
     # ----------------------------------------------------------------
-    # File upload via RunPod presigned URL
+    # File upload via Dropbox (intermediate storage)
     # ----------------------------------------------------------------
 
+    def _get_dropbox_access_token(self) -> Optional[str]:
+        """Extract access_token from rclone-format Dropbox token JSON."""
+        raw = self.cfg.dropbox_token
+        if not raw:
+            return None
+        try:
+            return json.loads(raw).get("access_token")
+        except (json.JSONDecodeError, TypeError):
+            return None
+
     def _upload_file(self, path: Path, label: str = "") -> Optional[str]:
-        """Upload file and return a download URL.
+        """Upload file to Dropbox and return a temporary download URL.
 
-        Uses RunPod's built-in blob storage for serverless file transfer.
-        Falls back to base64 inline if file is small enough (<10MB).
+        Uses Dropbox as intermediate storage so RunPod workers can
+        download input files directly. Temporary links expire in 4 hours.
         """
+        dbx_token = self._get_dropbox_access_token()
+        if not dbx_token:
+            self._emit("log", msg="No Dropbox token — cannot upload files")
+            return None
+
+        dbx_path = f"/vsl_cloud_tmp/{path.name}"
         file_size = path.stat().st_size
-
-        # For files up to 10MB, use base64 inline (no upload needed).
-        # The handler accepts both URL and inline data.
-        if file_size < 10 * 1024 * 1024:
-            return self._file_to_data_url(path)
-
-        # Use RunPod's presigned upload
-        upload_url = self._get_presigned_upload_url(path.name)
-        if not upload_url:
-            return None
+        size_mb = file_size / (1024 * 1024)
+        self._emit("log", msg=f"  Uploading {path.name} ({size_mb:.1f} MB) to Dropbox...")
 
         try:
-            with open(path, "rb") as f:
-                r = requests.put(
-                    upload_url["put_url"],
-                    data=f,
-                    headers={"Content-Type": "application/octet-stream"},
-                    timeout=600,
-                )
-                r.raise_for_status()
-            return upload_url["get_url"]
+            # Dropbox upload (up to 150MB with simple upload)
+            if file_size <= 150 * 1024 * 1024:
+                url = self._dbx_upload_simple(dbx_token, path, dbx_path)
+            else:
+                url = self._dbx_upload_session(dbx_token, path, dbx_path)
+
+            if url:
+                self._emit("log", msg=f"  Uploaded → getting download link...")
+            return url
         except Exception as e:
-            self._emit("log", msg=f"Upload failed ({label}): {e}")
+            self._emit("log", msg=f"  Upload failed ({label}): {e}")
             return None
 
-    def _get_presigned_upload_url(self, filename: str) -> Optional[dict]:
-        """Get presigned PUT/GET URLs from RunPod blob storage."""
-        url = f"{RUNPOD_API}/{self.cfg.endpoint_id}/upload"
-        try:
-            r = self._session.post(
-                url, json={"name": filename}, timeout=15,
+    def _dbx_upload_simple(self, token: str, local: Path, dbx_path: str) -> Optional[str]:
+        """Upload file ≤150MB via Dropbox simple upload, return temp link."""
+        with open(local, "rb") as f:
+            r = requests.post(
+                "https://content.dropboxapi.com/2/files/upload",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Dropbox-API-Arg": json.dumps({
+                        "path": dbx_path,
+                        "mode": "overwrite",
+                        "autorename": False,
+                    }),
+                    "Content-Type": "application/octet-stream",
+                },
+                data=f,
+                timeout=600,
             )
-            r.raise_for_status()
-            data = r.json()
-            return {"put_url": data["presignedUrl"], "get_url": data["url"]}
-        except Exception:
-            # Fallback: no presigned URL support → use data URL for
-            # files up to 50MB (RunPod payload limit)
+        if r.status_code not in (200, 409):
+            self._emit("log", msg=f"  Dropbox upload error: {r.status_code} {r.text[:200]}")
             return None
 
-    def _file_to_data_url(self, path: Path) -> str:
-        """Encode file as base64 data URL for inline transfer."""
-        import base64
-        with open(path, "rb") as f:
-            data = base64.b64encode(f.read()).decode("ascii")
-        return f"data:application/octet-stream;base64,{data}"
+        return self._dbx_get_temp_link(token, dbx_path)
+
+    def _dbx_upload_session(self, token: str, local: Path, dbx_path: str) -> Optional[str]:
+        """Upload file >150MB via Dropbox upload session (chunked)."""
+        chunk_size = 100 * 1024 * 1024  # 100MB chunks
+        file_size = local.stat().st_size
+
+        with open(local, "rb") as f:
+            # Start session
+            chunk = f.read(chunk_size)
+            r = requests.post(
+                "https://content.dropboxapi.com/2/files/upload_session/start",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/octet-stream",
+                },
+                data=chunk,
+                timeout=300,
+            )
+            if r.status_code != 200:
+                self._emit("log", msg=f"  Session start failed: {r.text[:200]}")
+                return None
+            session_id = r.json()["session_id"]
+            offset = len(chunk)
+
+            # Append chunks
+            while offset < file_size:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                remaining = file_size - offset - len(chunk)
+
+                if remaining > 0:
+                    # More chunks to come
+                    r = requests.post(
+                        "https://content.dropboxapi.com/2/files/upload_session/append_v2",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Dropbox-API-Arg": json.dumps({
+                                "cursor": {"session_id": session_id, "offset": offset},
+                                "close": False,
+                            }),
+                            "Content-Type": "application/octet-stream",
+                        },
+                        data=chunk,
+                        timeout=300,
+                    )
+                else:
+                    # Final chunk — finish session
+                    r = requests.post(
+                        "https://content.dropboxapi.com/2/files/upload_session/finish",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Dropbox-API-Arg": json.dumps({
+                                "cursor": {"session_id": session_id, "offset": offset},
+                                "commit": {
+                                    "path": dbx_path,
+                                    "mode": "overwrite",
+                                    "autorename": False,
+                                },
+                            }),
+                            "Content-Type": "application/octet-stream",
+                        },
+                        data=chunk,
+                        timeout=300,
+                    )
+                offset += len(chunk)
+
+        return self._dbx_get_temp_link(token, dbx_path)
+
+    def _dbx_get_temp_link(self, token: str, dbx_path: str) -> Optional[str]:
+        """Get a temporary download link (4 hours) for a Dropbox file."""
+        r = requests.post(
+            "https://api.dropboxapi.com/2/files/get_temporary_link",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"path": dbx_path},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            return r.json().get("link")
+        self._emit("log", msg=f"  Temp link failed: {r.status_code} {r.text[:200]}")
+        return None
 
     # ----------------------------------------------------------------
     # Utility
