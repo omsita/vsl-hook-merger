@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 # Install Python 3 (Ubuntu 22.04 default = 3.10) + system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv \
-    wget curl ca-certificates \
+    wget curl ca-certificates unzip \
     ffmpeg \
     && curl https://rclone.org/install.sh | bash \
     && ln -sf /usr/bin/python3 /usr/bin/python \
