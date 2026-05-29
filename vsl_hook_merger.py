@@ -32,8 +32,8 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("780x720")
-        self.root.minsize(680, 600)
+        self.root.geometry("780x860")
+        self.root.minsize(680, 700)
 
         self.cfg = cfg_store.load()
         self.events: Queue = Queue()
@@ -204,6 +204,28 @@ class App:
             side="left", padx=4, fill="x", expand=True)
         ttk.Button(cr3, text="Auto",
                    command=self._auto_mega_creds).pack(side="left", padx=(4, 0))
+        # Cloud timeline table (hidden by default, shown in cloud mode during run)
+        self._timeline_frame = ttk.LabelFrame(outer, text="Cloud Timeline")
+        tl_cols = ("combo", "worker", "status", "time")
+        self.tl_tree = ttk.Treeview(
+            self._timeline_frame, columns=tl_cols, show="headings", height=6,
+        )
+        self.tl_tree.heading("combo", text="Combo")
+        self.tl_tree.heading("worker", text="Worker")
+        self.tl_tree.heading("status", text="Status")
+        self.tl_tree.heading("time", text="Time")
+        self.tl_tree.column("combo", width=250)
+        self.tl_tree.column("worker", width=80, anchor="center")
+        self.tl_tree.column("status", width=120, anchor="center")
+        self.tl_tree.column("time", width=80, anchor="center")
+        tl_sb = ttk.Scrollbar(self._timeline_frame, orient="vertical",
+                              command=self.tl_tree.yview)
+        self.tl_tree.configure(yscrollcommand=tl_sb.set)
+        tl_sb.pack(side="right", fill="y")
+        self.tl_tree.pack(fill="both", expand=True, padx=4, pady=4)
+        # Packed/hidden by _apply_render_mode_visibility
+        self._timeline_items = {}  # combo_name → treeview item id
+
         # Cloud frame hidden initially
         # _on_render_mode_change controls visibility
 
@@ -308,8 +330,13 @@ class App:
             self._cloud_frame.pack(
                 fill="x", padx=8, pady=4, after=self._render_mode_frame,
             )
+            self._timeline_frame.pack(
+                fill="both", expand=True, padx=8, pady=4,
+                after=self._cloud_frame,
+            )
         else:
             self._cloud_frame.pack_forget()
+            self._timeline_frame.pack_forget()
 
     def _on_render_mode_change(self) -> None:
         self._apply_render_mode_visibility()
@@ -561,6 +588,15 @@ class App:
         self._log(f"=== Start batch ({self._run_total} files) "
                   f"[{job.workflow}] [cloud x{workers}] ===")
 
+        # Populate timeline with all combos
+        self.tl_tree.delete(*self.tl_tree.get_children())
+        self._timeline_items.clear()
+        for br in self.brolls:
+            iid = self.tl_tree.insert("", "end", values=(
+                br.stem, "—", "Pending", "—",
+            ))
+            self._timeline_items[br.name] = iid
+
         self.worker = CloudBatchWorker(job, self.events)
         self.worker.start()
 
@@ -606,6 +642,34 @@ class App:
             self.lbl_overall.config(text=f"{self._run_total}/{self._run_total}")
             self._log("=== Done ===")
             self._finish_run()
+        elif kind == "cloud_phase":
+            phase = ev.get("phase", "")
+            detail = ev.get("detail", "")
+            self.lbl_current.config(text=detail)
+            if phase == "prepare":
+                self.pb_current["value"] = 0
+            elif phase == "upload":
+                self.pb_current["value"] = 0
+            elif phase == "encode":
+                self.pb_current["value"] = 0
+                self.pb_overall["value"] = 0
+        elif kind == "cloud_progress":
+            val = ev.get("value", 0)
+            detail = ev.get("detail", "")
+            self.pb_overall["value"] = val
+            self.lbl_overall.config(text=detail)
+            self.lbl_current.config(text=detail)
+        elif kind == "cloud_file_status":
+            name = ev.get("name", "")
+            iid = self._timeline_items.get(name)
+            if iid:
+                worker = ev.get("worker", "—")
+                status = ev.get("status", "")
+                elapsed = ev.get("time", "—")
+                self.tl_tree.set(iid, "worker", worker)
+                self.tl_tree.set(iid, "status", status)
+                self.tl_tree.set(iid, "time", elapsed)
+                self.tl_tree.see(iid)
         elif kind == "fatal":
             self._log(f"FATAL: {ev['error']}")
             messagebox.showerror(APP_TITLE, ev["error"])

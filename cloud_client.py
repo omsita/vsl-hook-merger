@@ -92,6 +92,7 @@ class CloudBatchWorker(threading.Thread):
         # --- Step 1: Resolve file sources ---
         if use_mega:
             self._emit("log", msg=f"MEGA direct mode: {total_brolls} B-rolls")
+            self._emit("cloud_phase", phase="prepare", detail="Resolving MEGA paths...")
             vsl_source = self._to_mega_path(cfg.vsl)
             if not vsl_source:
                 self._emit("fatal", error="VSL not on MEGA mount — cannot resolve path")
@@ -99,19 +100,24 @@ class CloudBatchWorker(threading.Thread):
             self._emit("log", msg=f"  VSL: {vsl_source}")
 
             broll_entries = []
-            for br in cfg.brolls:
+            for i, br in enumerate(cfg.brolls):
                 mp = self._to_mega_path(br)
                 if mp:
                     broll_entries.append({"name": br.name, "mega_path": mp})
                 else:
                     self._emit("log", msg=f"  SKIP (not on MEGA): {br.name}")
+                self._emit("cloud_progress", value=(i + 1) / (total_brolls + 1),
+                           detail=f"Resolving {i+1}/{total_brolls}")
         else:
             # Fallback: upload via Dropbox
             self._emit("log", msg=f"Uploading VSL + {total_brolls} B-rolls via Dropbox...")
+            self._emit("cloud_phase", phase="upload", detail="Uploading VSL...")
             vsl_source = self._upload_file(cfg.vsl, "VSL")
             if not vsl_source:
                 self._emit("fatal", error="Failed to upload VSL")
                 return
+            self._emit("cloud_progress", value=1 / (total_brolls + 1),
+                       detail="VSL uploaded")
 
             broll_entries = []
             for i, br in enumerate(cfg.brolls):
@@ -119,6 +125,8 @@ class CloudBatchWorker(threading.Thread):
                     self._emit("cancelled")
                     return
                 self._emit("log", msg=f"  Upload B-roll {i+1}/{total_brolls}: {br.name}")
+                self._emit("cloud_progress", value=(i + 1) / (total_brolls + 1),
+                           detail=f"Uploading {i+1}/{total_brolls}")
                 url = self._upload_file(br, f"B-roll {i+1}/{total_brolls}")
                 if url:
                     broll_entries.append({"name": br.name, "url": url})
@@ -177,9 +185,14 @@ class CloudBatchWorker(threading.Thread):
                 job_ids.append({"id": job_id, "chunk": chunk, "worker": i + 1})
                 self._emit("log", msg=f"  Worker {i+1}: job {job_id} "
                            f"({len(chunk)} files)")
+                for br in chunk:
+                    self._emit("cloud_file_status", name=br["name"],
+                               worker=f"W{i+1}", status="Queued", time="—")
             else:
                 self._emit("log", msg=f"  Worker {i+1}: FAILED to submit")
                 for br in chunk:
+                    self._emit("cloud_file_status", name=br["name"],
+                               worker=f"W{i+1}", status="FAILED", time="—")
                     self._emit("file_error", idx=0, name=br["name"],
                                error="Job submit failed")
 
@@ -188,12 +201,15 @@ class CloudBatchWorker(threading.Thread):
             return
 
         self._emit("log", msg=f"Submitted {len(job_ids)} jobs, polling...")
+        self._emit("cloud_phase", phase="encode",
+                   detail=f"Encoding on {len(job_ids)} worker(s)...")
 
         # --- Step 4: Poll all jobs ---
         completed_jobs = set()
         file_idx = 0
+        total_jobs = len(job_ids)
 
-        while len(completed_jobs) < len(job_ids):
+        while len(completed_jobs) < total_jobs:
             if self.is_cancelled():
                 self._cancel_jobs(job_ids)
                 self._emit("cancelled")
@@ -211,9 +227,20 @@ class CloudBatchWorker(threading.Thread):
 
                 state = status.get("status")
 
-                if state == "IN_PROGRESS":
-                    self._emit("log",
-                               msg=f"  Worker {job['worker']}: encoding...")
+                wlabel = f"W{job['worker']}"
+
+                if state == "IN_QUEUE":
+                    self._emit("cloud_progress",
+                               value=len(completed_jobs) / total_jobs,
+                               detail=f"Worker {job['worker']}: queued...")
+                elif state == "IN_PROGRESS":
+                    self._emit("cloud_progress",
+                               value=(len(completed_jobs) + 0.5) / total_jobs,
+                               detail=f"Worker {job['worker']}: encoding...")
+                    for br in job["chunk"]:
+                        self._emit("cloud_file_status", name=br["name"],
+                                   worker=wlabel, status="Encoding...",
+                                   time="—")
                 elif state == "COMPLETED":
                     completed_jobs.add(job["id"])
                     output = status.get("output", {})
@@ -221,28 +248,46 @@ class CloudBatchWorker(threading.Thread):
 
                     for r in results:
                         file_idx += 1
-                        name = r.get("name", "?")
+                        rname = r.get("name", "?")
+                        elapsed = f"{r.get('seconds', 0):.0f}s"
+                        # Find original filename from chunk
+                        orig_name = rname
+                        for br in job["chunk"]:
+                            if Path(br["name"]).stem == rname:
+                                orig_name = br["name"]
+                                break
+
                         if r.get("status") == "ok":
-                            self._emit("file_start", idx=file_idx,
-                                       total=total_brolls, name=name)
-                            self._emit("progress", idx=file_idx, value=1.0)
                             size = r.get("size_mb", 0)
-                            path = r.get("name", "")
+                            path = orig_name
                             if cfg.dropbox_token:
-                                path = f"Dropbox:{cfg.dropbox_path}/{name}"
-                            self._emit("file_done", idx=file_idx, name=name,
+                                path = f"Dropbox:{cfg.dropbox_path}/{rname}"
+                            self._emit("file_start", idx=file_idx,
+                                       total=total_brolls, name=rname)
+                            self._emit("progress", idx=file_idx, value=1.0)
+                            self._emit("file_done", idx=file_idx, name=rname,
                                        path=path, size_mb=size)
+                            self._emit("cloud_file_status", name=orig_name,
+                                       worker=wlabel,
+                                       status=f"Done ({size:.1f}MB)",
+                                       time=elapsed)
                         else:
                             self._emit("file_start", idx=file_idx,
-                                       total=total_brolls, name=name)
-                            self._emit("file_error", idx=file_idx, name=name,
+                                       total=total_brolls, name=rname)
+                            self._emit("file_error", idx=file_idx, name=rname,
                                        error=r.get("error", "unknown"))
+                            self._emit("cloud_file_status", name=orig_name,
+                                       worker=wlabel, status="FAILED",
+                                       time=elapsed)
 
                     uploaded = output.get("uploaded_to_dropbox", 0)
                     encoded = output.get("encoded", 0)
                     self._emit("log",
                                msg=f"  Worker {job['worker']}: done "
                                f"({encoded} encoded, {uploaded} uploaded)")
+                    self._emit("cloud_progress",
+                               value=len(completed_jobs) / total_jobs,
+                               detail=f"{len(completed_jobs)}/{total_jobs} workers done")
 
                 elif state == "FAILED":
                     completed_jobs.add(job["id"])
@@ -253,6 +298,11 @@ class CloudBatchWorker(threading.Thread):
                         file_idx += 1
                         self._emit("file_error", idx=file_idx, name=br["name"],
                                    error=f"Worker failed: {error}")
+                        self._emit("cloud_file_status", name=br["name"],
+                                   worker=wlabel, status="FAILED", time="—")
+                    self._emit("cloud_progress",
+                               value=len(completed_jobs) / total_jobs,
+                               detail=f"{len(completed_jobs)}/{total_jobs} workers done")
 
         self._emit("all_done")
 
