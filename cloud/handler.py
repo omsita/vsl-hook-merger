@@ -227,13 +227,18 @@ def handler(event: dict) -> dict:
         download_file(source, dest)
         broll_paths.append(dest)
 
-    # Encode all
-    results = []
-    for bp in broll_paths:
+    # Encode all — parallel FFmpeg processes to maximize GPU NVENC utilization.
+    # RTX 4090 supports 3 concurrent NVENC sessions; CPU EPYC handles the rest.
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _encode_task(bp):
         stem = Path(bp).stem
         out = str(WORK / "output" / f"{stem}{suffix}.mp4")
-        result = encode_one(vsl_path, bp, out, settings, vsl_dur, vsl_lufs)
-        results.append(result)
+        return encode_one(vsl_path, bp, out, settings, vsl_dur, vsl_lufs)
+
+    max_parallel = min(3, len(broll_paths))
+    with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+        results = list(pool.map(_encode_task, broll_paths))
 
     # Push to Dropbox if configured
     uploaded = 0
