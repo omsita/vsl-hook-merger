@@ -78,12 +78,39 @@ def probe_lufs(path: str) -> float:
     return max(-70.0, min(-5.0, lufs))
 
 
-def download_file(url: str, dest: str) -> None:
-    """Download a file via wget with retry."""
-    subprocess.run(
-        ["wget", "-q", "--tries=3", "--timeout=60", url, "-O", dest],
-        check=True, timeout=1800,
-    )
+def setup_mega_rclone(mega_user: str, mega_pass: str) -> None:
+    """Configure rclone MEGA remote on-the-fly via env vars.
+
+    mega_pass should be rclone-obscured (from `rclone config dump`).
+    """
+    os.environ["RCLONE_CONFIG_MEGA_TYPE"] = "mega"
+    os.environ["RCLONE_CONFIG_MEGA_USER"] = mega_user
+    os.environ["RCLONE_CONFIG_MEGA_PASS"] = mega_pass
+
+
+def download_file(source: str, dest: str) -> None:
+    """Download a file from URL (wget) or MEGA path (rclone copy).
+
+    source formats:
+      - "mega:path/to/file.mp4"  → rclone copy
+      - "https://..."            → wget
+    """
+    if source.startswith("mega:"):
+        dest_dir = os.path.dirname(dest)
+        subprocess.run(
+            ["rclone", "copy", source, dest_dir, "--retries", "3"],
+            check=True, timeout=1800,
+        )
+        # rclone preserves filename — rename to expected dest if different
+        src_name = os.path.basename(source)
+        actual = os.path.join(dest_dir, src_name)
+        if actual != dest and os.path.exists(actual):
+            os.rename(actual, dest)
+    else:
+        subprocess.run(
+            ["wget", "-q", "--tries=3", "--timeout=60", source, "-O", dest],
+            check=True, timeout=1800,
+        )
 
 
 def encode_one(vsl_path: str, broll_path: str, out_path: str,
@@ -163,11 +190,17 @@ def handler(event: dict) -> dict:
     """RunPod serverless handler entry point."""
     job_input = event["input"]
 
-    vsl_url = job_input["vsl_url"]
+    vsl_source = job_input["vsl_url"]  # URL or "mega:path/to/file"
     brolls = job_input.get("brolls", [])
     settings = job_input.get("settings", {})
     dropbox_token = job_input.get("dropbox_token")
     dropbox_path = job_input.get("dropbox_path", "/VSL_Output")
+
+    # Setup MEGA rclone if credentials provided
+    mega_user = job_input.get("mega_user")
+    mega_pass = job_input.get("mega_pass")
+    if mega_user and mega_pass:
+        setup_mega_rclone(mega_user, mega_pass)
 
     workflow = settings.get("workflow", "overlay")
     suffix = "_seq_VSL" if workflow == "sequential" else "_hook_VSL"
@@ -178,7 +211,7 @@ def handler(event: dict) -> dict:
 
     # Download VSL
     vsl_path = str(WORK / "vsl.mp4")
-    download_file(vsl_url, vsl_path)
+    download_file(vsl_source, vsl_path)
     vsl_dur = probe_duration(vsl_path)
 
     # LUFS probe for sequential + normalize
@@ -190,7 +223,8 @@ def handler(event: dict) -> dict:
     broll_paths = []
     for br in brolls:
         dest = str(WORK / "brolls" / br["name"])
-        download_file(br["url"], dest)
+        source = br.get("url") or br.get("mega_path")
+        download_file(source, dest)
         broll_paths.append(dest)
 
     # Encode all

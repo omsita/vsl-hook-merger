@@ -191,6 +191,19 @@ class App:
             side="left", padx=4)
         ttk.Button(cr2, text="Get Token",
                    command=self._get_dropbox_token).pack(side="left", padx=(4, 0))
+        # Row 3: MEGA direct pull
+        cr3 = ttk.Frame(self._cloud_frame)
+        cr3.pack(fill="x", padx=8, pady=(0, 5))
+        self.var_mega_user = tk.StringVar()
+        self.var_mega_pass = tk.StringVar()
+        ttk.Label(cr3, text="MEGA:").pack(side="left")
+        ttk.Entry(cr3, textvariable=self.var_mega_user, width=22).pack(
+            side="left", padx=4)
+        ttk.Label(cr3, text="Pass:").pack(side="left")
+        ttk.Entry(cr3, textvariable=self.var_mega_pass, show="*", width=16).pack(
+            side="left", padx=4, fill="x", expand=True)
+        ttk.Button(cr3, text="Auto",
+                   command=self._auto_mega_creds).pack(side="left", padx=(4, 0))
         # Cloud frame hidden initially
         # _on_render_mode_change controls visibility
 
@@ -244,6 +257,8 @@ class App:
         self.var_cloud_workers.set(self.cfg.get("cloud_max_workers", 5))
         self.var_dbx_token.set(self.cfg.get("dropbox_token", ""))
         self.var_dbx_path.set(self.cfg.get("dropbox_path", "/VSL_Output"))
+        self.var_mega_user.set(self.cfg.get("mega_user", ""))
+        self.var_mega_pass.set(self.cfg.get("mega_pass", ""))
         # Re-apply visibility now that vars are restored from settings
         self._apply_workflow_visibility()
         self._apply_render_mode_visibility()
@@ -268,6 +283,8 @@ class App:
             "cloud_max_workers": int(self.var_cloud_workers.get()),
             "dropbox_token":   self.var_dbx_token.get(),
             "dropbox_path":    self.var_dbx_path.get(),
+            "mega_user":       self.var_mega_user.get(),
+            "mega_pass":       self.var_mega_pass.get(),
         })
         cfg_store.save(self.cfg)
 
@@ -297,6 +314,34 @@ class App:
     def _on_render_mode_change(self) -> None:
         self._apply_render_mode_visibility()
         self._persist_settings()
+
+    def _auto_mega_creds(self) -> None:
+        """Auto-detect MEGA credentials from rclone config."""
+        import threading
+
+        def _do():
+            try:
+                r = subprocess.run(
+                    ["rclone", "config", "dump"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    import json
+                    config = json.loads(r.stdout)
+                    for name, cfg in config.items():
+                        if cfg.get("type") == "mega":
+                            user = cfg.get("user", "")
+                            pw = cfg.get("pass", "")
+                            self.root.after(0, lambda: self.var_mega_user.set(user))
+                            self.root.after(0, lambda: self.var_mega_pass.set(pw))
+                            self.root.after(0, lambda: self._log(
+                                f"MEGA auto-detected: {user}"))
+                            return
+                    self.root.after(0, lambda: self._log("No MEGA remote in rclone config"))
+            except Exception as e:
+                self.root.after(0, lambda: self._log(f"rclone error: {e}"))
+
+        threading.Thread(target=_do, daemon=True).start()
 
     def _get_dropbox_token(self) -> None:
         """Run rclone authorize dropbox to get a token."""
@@ -503,6 +548,8 @@ class App:
             max_workers=int(self.var_cloud_workers.get()),
             dropbox_token=self.var_dbx_token.get().strip(),
             dropbox_path=self.var_dbx_path.get().strip() or "/VSL_Output",
+            mega_user=self.var_mega_user.get().strip(),
+            mega_pass=self.var_mega_pass.get().strip(),
         )
 
         self._run_total = len(self.brolls)

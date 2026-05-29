@@ -25,6 +25,10 @@ DEFAULT = {
     "cloud_max_workers": 5,
     "dropbox_token": "",
     "dropbox_path": "/VSL_Output",
+    "mega_user": "",
+    "mega_pass": "",
+    "mega_remote": "",
+    "mega_mount_drive": "",
 }
 
 

@@ -36,6 +36,9 @@ class CloudJobConfig:
     max_workers: int = 5
     dropbox_token: str = ""
     dropbox_path: str = "/VSL_Output"
+    mega_user: str = ""
+    mega_pass: str = ""       # rclone-obscured password
+    mega_remote: str = ""     # rclone remote name (e.g. "MEGA LONG")
 
 
 class CloudBatchWorker(threading.Thread):
@@ -84,36 +87,53 @@ class CloudBatchWorker(threading.Thread):
     def _run_pipeline(self) -> None:
         cfg = self.cfg
         total_brolls = len(cfg.brolls)
+        use_mega = bool(cfg.mega_user and cfg.mega_pass)
 
-        # --- Step 1: Upload files to get presigned URLs ---
-        self._emit("log", msg=f"Uploading VSL + {total_brolls} B-rolls...")
+        # --- Step 1: Resolve file sources ---
+        if use_mega:
+            self._emit("log", msg=f"MEGA direct mode: {total_brolls} B-rolls")
+            vsl_source = self._to_mega_path(cfg.vsl)
+            if not vsl_source:
+                self._emit("fatal", error="VSL not on MEGA mount — cannot resolve path")
+                return
+            self._emit("log", msg=f"  VSL: {vsl_source}")
 
-        vsl_url = self._upload_file(cfg.vsl, "Uploading VSL")
-        if not vsl_url:
-            self._emit("fatal", error="Failed to upload VSL")
+            broll_entries = []
+            for br in cfg.brolls:
+                mp = self._to_mega_path(br)
+                if mp:
+                    broll_entries.append({"name": br.name, "mega_path": mp})
+                else:
+                    self._emit("log", msg=f"  SKIP (not on MEGA): {br.name}")
+        else:
+            # Fallback: upload via Dropbox
+            self._emit("log", msg=f"Uploading VSL + {total_brolls} B-rolls via Dropbox...")
+            vsl_source = self._upload_file(cfg.vsl, "VSL")
+            if not vsl_source:
+                self._emit("fatal", error="Failed to upload VSL")
+                return
+
+            broll_entries = []
+            for i, br in enumerate(cfg.brolls):
+                if self.is_cancelled():
+                    self._emit("cancelled")
+                    return
+                self._emit("log", msg=f"  Upload B-roll {i+1}/{total_brolls}: {br.name}")
+                url = self._upload_file(br, f"B-roll {i+1}/{total_brolls}")
+                if url:
+                    broll_entries.append({"name": br.name, "url": url})
+                else:
+                    self._emit("log", msg=f"  SKIP upload failed: {br.name}")
+
+        if not broll_entries:
+            self._emit("fatal", error="No B-rolls resolved")
             return
 
         if self.is_cancelled():
             self._emit("cancelled")
             return
 
-        broll_entries = []
-        for i, br in enumerate(cfg.brolls):
-            if self.is_cancelled():
-                self._emit("cancelled")
-                return
-            self._emit("log", msg=f"  Upload B-roll {i+1}/{total_brolls}: {br.name}")
-            url = self._upload_file(br, f"B-roll {i+1}/{total_brolls}")
-            if url:
-                broll_entries.append({"name": br.name, "url": url})
-            else:
-                self._emit("log", msg=f"  SKIP upload failed: {br.name}")
-
-        if not broll_entries:
-            self._emit("fatal", error="No B-rolls uploaded successfully")
-            return
-
-        self._emit("log", msg=f"Upload done: VSL + {len(broll_entries)} B-rolls")
+        self._emit("log", msg=f"Ready: VSL + {len(broll_entries)} B-rolls")
 
         # --- Step 2: Split B-rolls across workers ---
         n_workers = min(cfg.max_workers, len(broll_entries))
@@ -138,11 +158,16 @@ class CloudBatchWorker(threading.Thread):
 
             payload = {
                 "input": {
-                    "vsl_url": vsl_url,
+                    "vsl_url": vsl_source,
                     "brolls": chunk,
                     "settings": settings,
                 }
             }
+            # MEGA credentials for worker to pull files directly
+            if use_mega:
+                payload["input"]["mega_user"] = cfg.mega_user
+                payload["input"]["mega_pass"] = cfg.mega_pass
+
             if cfg.dropbox_token:
                 payload["input"]["dropbox_token"] = cfg.dropbox_token
                 payload["input"]["dropbox_path"] = cfg.dropbox_path
@@ -419,6 +444,44 @@ class CloudBatchWorker(threading.Thread):
     # ----------------------------------------------------------------
     # Utility
     # ----------------------------------------------------------------
+
+    def _to_mega_path(self, local_path: Path) -> Optional[str]:
+        """Convert a local path (on rclone MEGA mount) to a mega:... path.
+
+        Detects the MEGA mount drive letter by checking if the file lives
+        under a known rclone mount point, then converts to mega: relative path.
+
+        Example: F:\\courses\\video.mp4 → mega:courses/video.mp4
+        """
+        s = str(local_path).replace("\\", "/")
+
+        # Try to find the MEGA mount point by checking drive letters
+        # rclone mount usually maps to a drive letter like F:, M:, etc.
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["rclone", "config", "dump"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                config = json.loads(r.stdout)
+                for name, cfg in config.items():
+                    if cfg.get("type") == "mega":
+                        # Found MEGA remote — check common mount letters
+                        # The path on Windows is like F:/path/to/file
+                        drive = s[:2]  # e.g. "F:"
+                        if drive and drive[1] == ":":
+                            # Assume this drive is the MEGA mount
+                            rel = s[3:]  # strip "F:/"
+                            return f"mega:{rel}"
+        except Exception:
+            pass
+
+        # Fallback: just strip drive letter and hope for the best
+        if len(s) > 2 and s[1] == ":":
+            return f"mega:{s[3:]}"
+
+        return None
 
     @staticmethod
     def _split_list(items: list, n: int) -> list[list]:
