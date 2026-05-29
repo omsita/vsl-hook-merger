@@ -3,7 +3,9 @@
 The GUI polls a thread-safe Queue and renders progress without freezing.
 """
 import threading
+import uuid
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from queue import Queue
 
@@ -86,15 +88,17 @@ class BatchWorker(threading.Thread):
                 vsl_lufs = None  # graceful degradation — batch continues
 
         total = len(self.cfg.brolls)
-        self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
         suffix = self._output_suffix()
+        day_dir = self.cfg.output_dir / date.today().isoformat()
+        day_dir.mkdir(parents=True, exist_ok=True)
 
         for idx, broll in enumerate(self.cfg.brolls, start=1):
             if self.is_cancelled():
                 self._emit("cancelled")
                 return
 
-            out_path = self.cfg.output_dir / f"{broll.stem}{suffix}.mp4"
+            uid = uuid.uuid4().hex[:4]
+            out_path = day_dir / f"{uid}_{broll.stem}{suffix}.mp4"
             self._emit("file_start", idx=idx, total=total, name=broll.name)
 
             if self.cfg.skip_existing and out_path.exists():

@@ -231,9 +231,12 @@ def handler(event: dict) -> dict:
     # RTX 4090 supports 3 concurrent NVENC sessions; CPU EPYC handles the rest.
     from concurrent.futures import ThreadPoolExecutor
 
+    import uuid
+
     def _encode_task(bp):
         stem = Path(bp).stem
-        out = str(WORK / "output" / f"{stem}{suffix}.mp4")
+        uid = uuid.uuid4().hex[:4]
+        out = str(WORK / "output" / f"{uid}_{stem}{suffix}.mp4")
         return encode_one(vsl_path, bp, out, settings, vsl_dur, vsl_lufs)
 
     max_parallel = min(3, len(broll_paths))

@@ -177,8 +177,10 @@ class CloudBatchWorker(threading.Thread):
                 payload["input"]["mega_pass"] = cfg.mega_pass
 
             if cfg.dropbox_token:
+                from datetime import date
+                day_path = f"{cfg.dropbox_path}/{date.today().isoformat()}"
                 payload["input"]["dropbox_token"] = cfg.dropbox_token
-                payload["input"]["dropbox_path"] = cfg.dropbox_path
+                payload["input"]["dropbox_path"] = day_path
 
             job_id = self._submit_job(payload)
             if job_id:
