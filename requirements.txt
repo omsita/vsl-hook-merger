@@ -1,0 +1,4 @@
+# Requires Python 3.10+ and FFmpeg (ffmpeg + ffprobe) installed separately.
+# Local mode: no external dependencies (stdlib only).
+# Cloud mode: requires requests for RunPod API.
+requests>=2.28
